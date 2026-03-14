@@ -1,3 +1,4 @@
+# LibreFang deploy worker — auto-deployed via GitHub Actions
 name = "librefang-deploy"
 main = "src/index.js"
 compatibility_date = "2024-12-01"
