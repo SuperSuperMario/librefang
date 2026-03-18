@@ -4884,6 +4884,69 @@ impl LibreFangKernel {
                                     }
                                 }
                             }
+                            librefang_types::scheduler::CronAction::Workflow {
+                                workflow_id,
+                                input,
+                                timeout_secs,
+                            } => {
+                                tracing::debug!(job = %job_name, workflow = %workflow_id, "Cron: firing workflow");
+                                let input_text = input.clone().unwrap_or_default();
+                                let delivery = job.delivery.clone();
+                                let timeout_s = timeout_secs.unwrap_or(300);
+                                let timeout = std::time::Duration::from_secs(timeout_s);
+
+                                // Resolve workflow by UUID first, then by name
+                                let resolved_id =
+                                    if let Ok(uuid) = uuid::Uuid::parse_str(workflow_id) {
+                                        Some(crate::workflow::WorkflowId(uuid))
+                                    } else {
+                                        // Search by name
+                                        let workflows = kernel.workflows.list_workflows().await;
+                                        workflows
+                                            .iter()
+                                            .find(|w| w.name == *workflow_id)
+                                            .map(|w| w.id)
+                                    };
+
+                                match resolved_id {
+                                    Some(wf_id) => {
+                                        match tokio::time::timeout(
+                                            timeout,
+                                            kernel.run_workflow(wf_id, input_text),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok((_run_id, output))) => {
+                                                tracing::info!(job = %job_name, "Cron workflow completed successfully");
+                                                kernel.cron_scheduler.record_success(job_id);
+                                                cron_deliver_response(
+                                                    &kernel, agent_id, &output, &delivery,
+                                                )
+                                                .await;
+                                            }
+                                            Ok(Err(e)) => {
+                                                let err_msg = format!("{e}");
+                                                tracing::warn!(job = %job_name, error = %err_msg, "Cron workflow failed");
+                                                kernel
+                                                    .cron_scheduler
+                                                    .record_failure(job_id, &err_msg);
+                                            }
+                                            Err(_) => {
+                                                tracing::warn!(job = %job_name, timeout_s, "Cron workflow timed out");
+                                                kernel.cron_scheduler.record_failure(
+                                                    job_id,
+                                                    &format!("workflow timed out after {timeout_s}s"),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        let err_msg = format!("workflow not found: {workflow_id}");
+                                        tracing::warn!(job = %job_name, error = %err_msg, "Cron workflow lookup failed");
+                                        kernel.cron_scheduler.record_failure(job_id, &err_msg);
+                                    }
+                                }
+                            }
                         }
                     }
 
