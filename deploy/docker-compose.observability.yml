@@ -1,3 +1,5 @@
+name: librefang
+
 services:
   prometheus:
     image: prom/prometheus:latest
