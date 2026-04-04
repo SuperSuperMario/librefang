@@ -14,6 +14,7 @@ import { Badge } from "../components/ui/Badge";
 import { MarkdownContent } from "../components/ui/MarkdownContent";
 import { useUIStore } from "../lib/store";
 import { ToolCallCard } from "../components/ui/ToolCallCard";
+import { filterVisible } from "../lib/hiddenModels";
 import { Typewriter_v2 } from "../components/Typewriter_v2";
 import "katex/dist/katex.min.css";
 
@@ -750,6 +751,9 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, wsConnecte
   const [patchPending, setPatchPending] = useState(false);
   const [optimisticModel, setOptimisticModel] = useState<string | null>(null);
 
+  const hiddenModelKeys = useUIStore((s) => s.hiddenModelKeys);
+  const hiddenSet = useMemo(() => new Set(hiddenModelKeys), [hiddenModelKeys]);
+
   // Clear optimistic model once the real modelName catches up
   useEffect(() => {
     if (optimisticModel && modelName === optimisticModel) {
@@ -792,7 +796,8 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, wsConnecte
       .finally(() => setModelLoading(false));
   }, [modelOpen, models.length, modelLoading]);
 
-  const filteredModels = models.filter(m =>
+  const visibleModels = useMemo(() => filterVisible(models, hiddenSet), [models, hiddenSet]);
+  const filteredModels = visibleModels.filter(m =>
     (m.provider + " " + (m.id || "")).toLowerCase().includes(modelSearch.toLowerCase())
   );
 
@@ -884,6 +889,19 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, wsConnecte
                 )}
                 {!modelLoading && !modelFetchError && filteredModels.length === 0 && (
                   <p className="px-2.5 py-2 text-xs text-text-dim">{t("chat.no_models_found")}</p>
+                )}
+                {!modelLoading && !modelFetchError && modelName && !filteredModels.some(m => m.id === modelName) && (
+                  <div
+                    key={`fallback/${modelName}`}
+                    onClick={() => {}}
+                    className="flex items-center gap-2 px-2.5 py-2 rounded-lg cursor-pointer transition-colors bg-brand/10 text-brand"
+                  >
+                    {patchPending
+                      ? <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                      : <span className="w-1.5 h-1.5 rounded-full bg-success shrink-0" />
+                    }
+                    <span className="text-xs font-medium truncate">{modelName}</span>
+                  </div>
                 )}
                 {!modelLoading && !modelFetchError && filteredModels.map(model => {
                   const isActive = model.id === (optimisticModel ?? modelName);
