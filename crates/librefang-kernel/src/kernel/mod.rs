@@ -3205,6 +3205,7 @@ system_prompt = "You are a helpful assistant."
         );
         let usage_record = librefang_memory::usage::UsageRecord {
             agent_id,
+            provider: manifest.model.provider.clone(),
             model: model.clone(),
             input_tokens: result.total_usage.input_tokens,
             output_tokens: result.total_usage.output_tokens,
@@ -3998,6 +3999,7 @@ system_prompt = "You are a helpful assistant."
                     );
                     let usage_record = librefang_memory::usage::UsageRecord {
                         agent_id,
+                        provider: manifest.model.provider.clone(),
                         model: model.clone(),
                         input_tokens: result.total_usage.input_tokens,
                         output_tokens: result.total_usage.output_tokens,
@@ -5156,6 +5158,7 @@ system_prompt = "You are a helpful assistant."
         );
         let usage_record = librefang_memory::usage::UsageRecord {
             agent_id,
+            provider: manifest.model.provider.clone(),
             model: model.clone(),
             input_tokens: result.total_usage.input_tokens,
             output_tokens: result.total_usage.output_tokens,
