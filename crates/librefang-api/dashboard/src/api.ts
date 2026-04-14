@@ -541,9 +541,13 @@ export interface HandDefinitionItem {
 export interface HandInstanceItem {
   instance_id: string;
   hand_id?: string;
+  hand_name?: string;
+  hand_icon?: string;
   status?: string;
   agent_id?: string;
   agent_name?: string;
+  agent_ids?: Record<string, string>;
+  coordinator_role?: string;
   activated_at?: string;
   updated_at?: string;
 }
@@ -781,9 +785,19 @@ export async function patchAgentConfig(agentId: string, config: { max_tokens?: n
   return patch<ApiActionResponse>(`/api/agents/${encodeURIComponent(agentId)}/config`, config);
 }
 
-export async function listAgents(): Promise<AgentItem[]> {
+export async function listAgents(
+  opts: { includeHands?: boolean } = {},
+): Promise<AgentItem[]> {
+  const params = new URLSearchParams({
+    limit: "200",
+    sort: "last_active",
+    order: "desc",
+  });
+  if (opts.includeHands) {
+    params.set("include_hands", "true");
+  }
   const data = await get<PaginatedResponse<AgentItem>>(
-    "/api/agents?limit=200&sort=last_active&order=desc"
+    `/api/agents?${params.toString()}`,
   );
   return data.items ?? [];
 }
