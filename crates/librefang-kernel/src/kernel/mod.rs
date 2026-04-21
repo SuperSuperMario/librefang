@@ -2152,6 +2152,19 @@ impl LibreFangKernel {
             }
         }
 
+        // Initialize trigger engine and reload persisted triggers
+        let trigger_engine = TriggerEngine::with_config(&config.triggers, &config.home_dir);
+        match trigger_engine.load() {
+            Ok(count) => {
+                if count > 0 {
+                    info!("Loaded {count} trigger job(s) from disk");
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load trigger jobs: {e}");
+            }
+        }
+
         // Initialize execution approval manager
         let approval_manager = crate::approval::ApprovalManager::new_with_db(
             config.approval.clone(),
@@ -2227,7 +2240,6 @@ impl LibreFangKernel {
 
         let workflow_home_dir = config.home_dir.clone();
         let oauth_home_dir = config.home_dir.clone();
-        let trigger_config = config.triggers.clone();
         // Resolve the audit anchor path from `[audit].anchor_path`. When
         // unset, the default is `data_dir/audit.anchor` — good enough to
         // catch most casual tampering since it sits next to the SQLite
@@ -2258,7 +2270,7 @@ impl LibreFangKernel {
             supervisor,
             workflows: WorkflowEngine::new_with_persistence(&workflow_home_dir),
             template_registry: WorkflowTemplateRegistry::new(),
-            triggers: TriggerEngine::with_config(&trigger_config),
+            triggers: trigger_engine,
             background,
             audit_log: Arc::new(AuditLog::with_db_anchored(
                 memory.usage_conn(),
@@ -2963,15 +2975,26 @@ system_prompt = "You are a helpful assistant."
             "ok",
         );
 
-        // For proactive agents spawned at runtime, auto-register triggers
+        // For proactive agents spawned at runtime, auto-register triggers.
+        // Skip any pattern already present (e.g. reloaded from trigger_jobs.json on restart).
         if let ScheduleMode::Proactive { conditions } = &entry.manifest.schedule {
+            let mut registered = false;
             for condition in conditions {
                 if let Some(pattern) = background::parse_condition(condition) {
+                    if self.triggers.agent_has_pattern(agent_id, &pattern) {
+                        continue;
+                    }
                     let prompt = format!(
                         "[PROACTIVE ALERT] Condition '{condition}' matched: {{{{event}}}}. \
                          Review and take appropriate action. Agent: {name}"
                     );
                     self.triggers.register(agent_id, pattern, prompt, 0);
+                    registered = true;
+                }
+            }
+            if registered {
+                if let Err(e) = self.triggers.persist() {
+                    warn!(agent = %name, "Failed to persist proactive triggers: {e}");
                 }
             }
         }
@@ -2986,7 +3009,12 @@ system_prompt = "You are a helpful assistant."
             }),
         );
         // Evaluate triggers synchronously (we can't await in a sync fn, so just evaluate)
-        let _triggered = self.triggers.evaluate(&event);
+        let (triggered, trigger_state_mutated) = self.triggers.evaluate(&event);
+        if !triggered.is_empty() || trigger_state_mutated {
+            if let Err(e) = self.triggers.persist() {
+                warn!("Failed to persist trigger jobs after spawn event: {e}");
+            }
+        }
 
         Ok(agent_id)
     }
@@ -7135,6 +7163,9 @@ system_prompt = "You are a helpful assistant."
         self.capabilities.revoke_all(agent_id);
         self.event_bus.unsubscribe_agent(agent_id);
         self.triggers.remove_agent_triggers(agent_id);
+        if let Err(e) = self.triggers.persist() {
+            warn!("Failed to persist trigger jobs after agent deletion: {e}");
+        }
 
         // Remove cron jobs so they don't linger as orphans (#504)
         let cron_removed = self.cron_scheduler.remove_agent_jobs(agent_id);
@@ -7552,6 +7583,9 @@ system_prompt = "You are a helpful assistant."
                         "Dropping saved triggers for removed hand role during reactivation"
                     );
                 }
+            }
+            if let Err(e) = self.triggers.persist() {
+                warn!("Failed to persist trigger jobs after hand reactivation: {e}");
             }
         }
 
@@ -8075,7 +8109,12 @@ system_prompt = "You are a helpful assistant."
         let _guard = DepthGuard;
 
         // Evaluate triggers before publishing (so describe_event works on the event)
-        let triggered = self.triggers.evaluate(&event);
+        let (triggered, trigger_state_mutated) = self.triggers.evaluate(&event);
+        if !triggered.is_empty() || trigger_state_mutated {
+            if let Err(e) = self.triggers.persist() {
+                warn!("Failed to persist trigger jobs after fire: {e}");
+            }
+        }
 
         // Publish to the event bus
         self.event_bus.publish(event).await;
@@ -8110,7 +8149,15 @@ system_prompt = "You are a helpful assistant."
         prompt_template: String,
         max_fires: u64,
     ) -> KernelResult<TriggerId> {
-        self.register_trigger_with_target(agent_id, pattern, prompt_template, max_fires, None)
+        self.register_trigger_with_target(
+            agent_id,
+            pattern,
+            prompt_template,
+            max_fires,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Register a trigger with an optional cross-session target agent.
@@ -8124,6 +8171,8 @@ system_prompt = "You are a helpful assistant."
         prompt_template: String,
         max_fires: u64,
         target_agent: Option<AgentId>,
+        cooldown_secs: Option<u64>,
+        session_mode: Option<librefang_types::agent::SessionMode>,
     ) -> KernelResult<TriggerId> {
         // Verify owner agent exists
         if self.registry.get(agent_id).is_none() {
@@ -8139,23 +8188,41 @@ system_prompt = "You are a helpful assistant."
                 )));
             }
         }
-        Ok(self.triggers.register_with_target(
+        let id = self.triggers.register_with_target(
             agent_id,
             pattern,
             prompt_template,
             max_fires,
             target_agent,
-        ))
+            cooldown_secs,
+            session_mode,
+        );
+        if let Err(e) = self.triggers.persist() {
+            warn!(trigger_id = %id, "Failed to persist trigger jobs after register: {e}");
+        }
+        Ok(id)
     }
 
     /// Remove a trigger by ID.
     pub fn remove_trigger(&self, trigger_id: TriggerId) -> bool {
-        self.triggers.remove(trigger_id)
+        let removed = self.triggers.remove(trigger_id);
+        if removed {
+            if let Err(e) = self.triggers.persist() {
+                warn!(%trigger_id, "Failed to persist trigger jobs after remove: {e}");
+            }
+        }
+        removed
     }
 
     /// Enable or disable a trigger. Returns true if found.
     pub fn set_trigger_enabled(&self, trigger_id: TriggerId, enabled: bool) -> bool {
-        self.triggers.set_enabled(trigger_id, enabled)
+        let found = self.triggers.set_enabled(trigger_id, enabled);
+        if found {
+            if let Err(e) = self.triggers.persist() {
+                warn!(%trigger_id, "Failed to persist trigger jobs after set_enabled: {e}");
+            }
+        }
+        found
     }
 
     /// List all triggers (optionally filtered by agent).
@@ -8164,6 +8231,26 @@ system_prompt = "You are a helpful assistant."
             Some(id) => self.triggers.list_agent_triggers(id),
             None => self.triggers.list_all(),
         }
+    }
+
+    /// Get a single trigger by ID.
+    pub fn get_trigger(&self, trigger_id: TriggerId) -> Option<crate::triggers::Trigger> {
+        self.triggers.get_trigger(trigger_id)
+    }
+
+    /// Update mutable fields of an existing trigger.
+    pub fn update_trigger(
+        &self,
+        trigger_id: TriggerId,
+        patch: crate::triggers::TriggerPatch,
+    ) -> Option<crate::triggers::Trigger> {
+        let result = self.triggers.update(trigger_id, patch);
+        if result.is_some() {
+            if let Err(e) = self.triggers.persist() {
+                warn!(%trigger_id, "Failed to persist trigger jobs after update: {e}");
+            }
+        }
+        result
     }
 
     /// Register a workflow definition.
@@ -8366,6 +8453,11 @@ system_prompt = "You are a helpful assistant."
                                             migrated = t_migrated,
                                             "Reassigned triggers after restart"
                                         );
+                                        if let Err(e) = self.triggers.persist() {
+                                            warn!(
+                                                "Failed to persist trigger jobs after hand restore: {e}"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -9261,18 +9353,29 @@ system_prompt = "You are a helpful assistant."
         name: &str,
         schedule: &ScheduleMode,
     ) {
-        // For proactive agents, auto-register triggers from conditions
+        // For proactive agents, auto-register triggers from conditions.
+        // Skip patterns already present (loaded from trigger_jobs.json on restart).
         if let ScheduleMode::Proactive { conditions } = schedule {
+            let mut registered = false;
             for condition in conditions {
                 if let Some(pattern) = background::parse_condition(condition) {
+                    if self.triggers.agent_has_pattern(agent_id, &pattern) {
+                        continue;
+                    }
                     let prompt = format!(
                         "[PROACTIVE ALERT] Condition '{condition}' matched: {{{{event}}}}. \
                          Review and take appropriate action. Agent: {name}"
                     );
                     self.triggers.register(agent_id, pattern, prompt, 0);
+                    registered = true;
                 }
             }
-            info!(agent = %name, id = %agent_id, "Registered proactive triggers");
+            if registered {
+                if let Err(e) = self.triggers.persist() {
+                    warn!(agent = %name, id = %agent_id, "Failed to persist proactive triggers: {e}");
+                }
+                info!(agent = %name, id = %agent_id, "Registered proactive triggers");
+            }
         }
 
         // Start continuous/periodic loops
