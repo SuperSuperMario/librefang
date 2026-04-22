@@ -585,6 +585,10 @@ struct ToolExecutionContext<'a> {
     streaming: bool,
     agent_id_str: &'a str,
     opts: &'a LoopOptions,
+    /// Per-session interrupt handle propagated into tool execution so that
+    /// long-running tools (shell_exec, agent_send, …) can observe a /stop
+    /// signal without polling a global flag.
+    interrupt: Option<crate::interrupt::SessionInterrupt>,
 }
 
 async fn execute_single_tool_call(
@@ -749,7 +753,7 @@ async fn execute_single_tool_call(
             ctx.sender_user_id,
             ctx.sender_channel,
             ctx.checkpoint_manager,
-            Some(ctx.session.id.to_string()).as_deref(),
+            ctx.interrupt.clone(),
         ),
     )
     .await
@@ -1227,6 +1231,14 @@ pub struct LoopOptions {
     /// the `tool_use` block) but cannot actually invoke it — same
     /// defense-in-depth as libre-code's `createAutoMemCanUseTool`.
     pub allowed_tools: Option<Vec<String>>,
+    /// Per-session interrupt handle.  When `Some`, long-running tools
+    /// (shell_exec, sub-process tools) poll this flag and abort promptly
+    /// when it is set.  When `None`, no interrupt checking is performed.
+    ///
+    /// The handle is created once per session/turn and cloned into each
+    /// `ToolExecutionContext` so that cancelling the parent session
+    /// interrupts all its in-flight tools without affecting other sessions.
+    pub interrupt: Option<crate::interrupt::SessionInterrupt>,
 }
 
 /// Result of an agent loop execution.
@@ -2679,6 +2691,18 @@ pub async fn run_agent_loop(
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
 
+        // Check for session-scoped interrupt at each iteration boundary.
+        // This allows a /stop signal to abort the loop between LLM calls
+        // without affecting other concurrent sessions.
+        if opts.interrupt.as_ref().is_some_and(|i| i.is_cancelled()) {
+            debug!(iteration, "Agent loop interrupted by session cancel signal");
+            return Ok(AgentLoopResult {
+                silent: true,
+                new_messages_start,
+                ..Default::default()
+            });
+        }
+
         // Fire agent:step external hook (fire-and-forget).
         if let Some(ref k) = kernel {
             k.fire_agent_step(&agent_id_str, iteration);
@@ -3069,6 +3093,7 @@ pub async fn run_agent_loop(
                         streaming: false,
                         agent_id_str: agent_id_str.as_str(),
                         opts,
+                        interrupt: opts.interrupt.clone(),
                     };
                     let executed = execute_single_tool_call(&mut tool_exec_ctx, tool_call).await?;
 
@@ -3806,6 +3831,19 @@ pub async fn run_agent_loop_streaming(
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
 
+        // Check for session-scoped interrupt at each iteration boundary.
+        if opts.interrupt.as_ref().is_some_and(|i| i.is_cancelled()) {
+            debug!(
+                iteration,
+                "Streaming agent loop interrupted by session cancel signal"
+            );
+            return Ok(AgentLoopResult {
+                silent: true,
+                new_messages_start,
+                ..Default::default()
+            });
+        }
+
         // Pluggable context engine: threshold-gated compaction (same as the
         // non-streaming loop). `last_prompt_tokens` carries only the previous
         // turn's prompt cost — never the cumulative total.  `total_usage`
@@ -4241,6 +4279,7 @@ pub async fn run_agent_loop_streaming(
                         streaming: true,
                         agent_id_str: agent_id_str.as_str(),
                         opts,
+                        interrupt: opts.interrupt.clone(),
                     };
                     let executed = execute_single_tool_call(&mut tool_exec_ctx, tool_call).await?;
 
