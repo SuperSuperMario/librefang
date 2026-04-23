@@ -14533,6 +14533,27 @@ impl KernelHandle for LibreFangKernel {
         cfg.tool_timeout_secs
     }
 
+    fn tool_timeout_secs_for(&self, tool_name: &str) -> u64 {
+        let cfg = self.config.load();
+        // 1. Exact match
+        if let Some(&t) = cfg.tool_timeouts.get(tool_name) {
+            return t;
+        }
+        // 2. Best glob match — longest pattern wins (most specific first).
+        // HashMap iteration is unordered; picking the longest matching pattern
+        // gives deterministic resolution when multiple globs match.
+        let best = cfg
+            .tool_timeouts
+            .iter()
+            .filter(|(pattern, _)| librefang_types::capability::glob_matches(pattern, tool_name))
+            .max_by_key(|(pattern, _)| pattern.len());
+        if let Some((_, &timeout)) = best {
+            return timeout;
+        }
+        // 3. Global fallback
+        cfg.tool_timeout_secs
+    }
+
     fn max_agent_call_depth(&self) -> u32 {
         let cfg = self.config.load();
         cfg.max_agent_call_depth
