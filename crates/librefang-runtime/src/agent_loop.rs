@@ -2359,6 +2359,7 @@ async fn generate_search_queries(
         system: Some(system),
         thinking: None,
         prompt_caching: false,
+        cache_ttl: None,
         response_format: None,
         timeout_secs: Some(15),
         extra_body: None,
@@ -3243,6 +3244,7 @@ pub async fn run_agent_loop(
             system: Some(system_prompt.clone()),
             thinking: manifest.thinking.clone(),
             prompt_caching,
+            cache_ttl: None,
             response_format: manifest.response_format.clone(),
             timeout_secs: timeout_override,
             extra_body: if manifest.model.extra_params.is_empty() {
@@ -4595,6 +4597,7 @@ pub async fn run_agent_loop_streaming(
             system: Some(system_prompt.clone()),
             thinking: manifest.thinking.clone(),
             prompt_caching,
+            cache_ttl: None,
             response_format: manifest.response_format.clone(),
             timeout_secs: timeout_override,
             extra_body: if manifest.model.extra_params.is_empty() {
