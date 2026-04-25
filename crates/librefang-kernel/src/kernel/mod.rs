@@ -2840,14 +2840,26 @@ impl LibreFangKernel {
                     if toml_path.exists() {
                         match std::fs::read_to_string(&toml_path) {
                             Ok(toml_str) => {
-                                // Try parsing as AgentManifest first; fall back to
-                                // extracting from a hand.toml (HandDefinition format).
-                                let parsed =
-                                    toml::from_str::<librefang_types::agent::AgentManifest>(
-                                        &toml_str,
-                                    )
-                                    .ok()
-                                    .or_else(|| extract_manifest_from_hand_toml(&toml_str, &name));
+                                // Try the hand-extraction path FIRST, then fall back
+                                // to parsing as a flat AgentManifest.
+                                //
+                                // Order matters: AgentManifest deserialization is lenient
+                                // and will silently accept a hand.toml as a "partial"
+                                // AgentManifest, picking up top-level `name`/`description`
+                                // and defaulting `model.system_prompt` to the
+                                // ModelConfig::default() stub ("You are a helpful AI agent.")
+                                // because the real prompt is nested under `[agents.<role>.model]`
+                                // and never reached. The hand-extraction path correctly walks
+                                // the nested structure; HandDefinition deserialization requires
+                                // top-level `id` + `category` so it cleanly returns None for
+                                // standalone agent.toml files.
+                                let parsed = extract_manifest_from_hand_toml(&toml_str, &name)
+                                    .or_else(|| {
+                                        toml::from_str::<librefang_types::agent::AgentManifest>(
+                                            &toml_str,
+                                        )
+                                        .ok()
+                                    });
                                 match parsed {
                                     Some(mut disk_manifest) => {
                                         // Compare key fields to detect changes
@@ -2867,6 +2879,17 @@ impl LibreFangKernel {
                                             if disk_manifest.tags.is_empty() {
                                                 disk_manifest.tags = entry.manifest.tags.clone();
                                             }
+                                            // Always preserve the canonical name. For hand-derived
+                                            // agents the DB name is "{hand_id}:{manifest.name}"
+                                            // (stamped at hand activation — grep for
+                                            // `format!("{hand_id}:{}", manifest.name)`) while the
+                                            // TOML only carries the bare "{manifest.name}". Letting
+                                            // the disk version overwrite the canonical name here
+                                            // would break `find_by_name` lookups, channel routing,
+                                            // and peer discovery — all of which key on the colon
+                                            // form. Mirrors the runtime hot-reload path lower in
+                                            // this file.
+                                            disk_manifest.name = entry.manifest.name.clone();
                                             entry.manifest = disk_manifest;
                                             // Persist the update back to DB
                                             if let Err(e) = kernel.memory.save_agent(&entry) {
@@ -2874,6 +2897,35 @@ impl LibreFangKernel {
                                                     agent = %name,
                                                     "Failed to persist TOML update: {e}"
                                                 );
+                                            }
+
+                                            // Re-materialize named workspaces and rewrite TOOLS.md
+                                            // so a HAND.toml gaining `[agents.<role>.workspaces]`
+                                            // (or any other manifest change that affects what's
+                                            // injected into TOOLS.md) takes effect on `restart`
+                                            // without forcing a hand deactivate/reactivate cycle —
+                                            // which would destroy triggers, cron jobs, and runtime
+                                            // sessions. Both helpers are idempotent: the dir is
+                                            // create_dir_all'd, TOOLS.md is force-rewritten with
+                                            // truncate, and user-editable identity files use
+                                            // create_new so manual edits are preserved.
+                                            //
+                                            // Skip when workspace is None — a manifest without a
+                                            // resolved workspace path has never been spawned, so
+                                            // the normal spawn flow at register_agent() will run
+                                            // these helpers when activation eventually happens.
+                                            if let Some(ref ws_dir) = entry.manifest.workspace {
+                                                let resolved_workspaces = ensure_named_workspaces(
+                                                    &cfg.effective_workspaces_dir(),
+                                                    &entry.manifest.workspaces,
+                                                );
+                                                if entry.manifest.generate_identity_files {
+                                                    generate_identity_files(
+                                                        ws_dir,
+                                                        &entry.manifest,
+                                                        &resolved_workspaces,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -8012,11 +8064,13 @@ system_prompt = "You are a helpful assistant."
             )))
         })?;
 
-        // Parse as AgentManifest; if that fails, try extracting from a hand.toml.
+        // Try the hand-extraction path FIRST, then fall back to flat AgentManifest.
+        // See the boot loop for the rationale — AgentManifest::deserialize is lenient
+        // enough to accept a hand.toml and silently produce a stub manifest with
+        // the default "You are a helpful AI agent." system prompt.
         let mut disk_manifest: librefang_types::agent::AgentManifest =
-            toml::from_str::<librefang_types::agent::AgentManifest>(&toml_str)
-                .ok()
-                .or_else(|| extract_manifest_from_hand_toml(&toml_str, &entry.name))
+            extract_manifest_from_hand_toml(&toml_str, &entry.name)
+                .or_else(|| toml::from_str::<librefang_types::agent::AgentManifest>(&toml_str).ok())
                 .ok_or_else(|| {
                     KernelError::LibreFang(LibreFangError::Internal(format!(
                         "Invalid TOML in {}: not an agent manifest or hand definition",
