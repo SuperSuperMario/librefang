@@ -11,6 +11,7 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use axum::middleware::Next;
 use librefang_kernel::auth::UserRole;
+use librefang_types::agent::UserId;
 use librefang_types::i18n;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +46,11 @@ pub struct AuthState {
     /// api_key on a non-loopback bind. Off by default so empty keys
     /// fail closed for LAN/public origins (see issue #1034 port).
     pub allow_no_auth: bool,
+    /// RBAC M5: optional handle to the kernel's audit log so the
+    /// middleware can record `PermissionDenied` events when a request is
+    /// rejected by the role gate. Wrapped in `Option` because some test
+    /// harnesses construct `AuthState` without a kernel attached.
+    pub audit_log: Option<Arc<librefang_runtime::audit::AuditLog>>,
 }
 
 #[derive(Clone)]
@@ -52,12 +58,20 @@ pub struct ApiUserAuth {
     pub name: String,
     pub role: UserRole,
     pub api_key_hash: String,
+    /// Stable LibreFang user id derived from `name` via [`UserId::from_name`].
+    /// Pre-computed at config-load so the auth middleware does not need a
+    /// kernel handle to identify the caller.
+    pub user_id: UserId,
 }
 
 #[derive(Clone, Debug)]
 pub struct AuthenticatedApiUser {
     pub name: String,
     pub role: UserRole,
+    /// Same id stored on [`ApiUserAuth`]; downstream handlers read this
+    /// from request extensions to pass the caller through to kernel
+    /// `authorize()` calls and into [`librefang_runtime::audit::AuditEntry`].
+    pub user_id: UserId,
 }
 
 /// Endpoints that mutate kernel-wide configuration, user accounts, or
@@ -608,6 +622,22 @@ pub async fn auth(
             .cloned()
         {
             if !user_role_allows_request(user.role, &method, path) {
+                // RBAC M5: surface the denial in the hash-chained audit
+                // log so an operator can correlate 403s with the user
+                // who tripped them. Best-effort — we do not have a
+                // direct kernel handle in the middleware extension so
+                // we read it back via the `audit_log_handle` injected
+                // into AuthState at server build time.
+                if let Some(ref audit) = auth_state.audit_log {
+                    audit.record_with_context(
+                        "system",
+                        librefang_runtime::audit::AuditAction::PermissionDenied,
+                        format!("{} {}", method, path),
+                        format!("role={}", user.role),
+                        Some(user.user_id),
+                        Some("api".to_string()),
+                    );
+                }
                 let lang = request
                     .extensions()
                     .get::<RequestLanguage>()
@@ -632,6 +662,7 @@ pub async fn auth(
             request.extensions_mut().insert(AuthenticatedApiUser {
                 name: user.name,
                 role: user.role,
+                user_id: user.user_id,
             });
             return next.run(request).await;
         }
@@ -953,6 +984,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/private", get(|| async { "ok" }))
@@ -983,9 +1015,11 @@ mod tests {
                 name: "Guest".to_string(),
                 role: UserRole::User,
                 api_key_hash: crate::password_hash::hash_password("user-key").unwrap(),
+                user_id: UserId::from_name("Guest"),
             }]),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route(
@@ -1019,9 +1053,11 @@ mod tests {
                 name: "Guest".to_string(),
                 role: UserRole::User,
                 api_key_hash: crate::password_hash::hash_password("user-key").unwrap(),
+                user_id: UserId::from_name("Guest"),
             }]),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route(
@@ -1055,9 +1091,11 @@ mod tests {
                 name: "ReadOnly".to_string(),
                 role: UserRole::Viewer,
                 api_key_hash: crate::password_hash::hash_password("viewer-key").unwrap(),
+                user_id: UserId::from_name("ReadOnly"),
             }]),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route(
@@ -1091,9 +1129,11 @@ mod tests {
                 name: "ReadOnly".to_string(),
                 role: UserRole::Viewer,
                 api_key_hash: crate::password_hash::hash_password("viewer-key").unwrap(),
+                user_id: UserId::from_name("ReadOnly"),
             }]),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/budget", get(|| async { "ok" }))
@@ -1126,9 +1166,11 @@ mod tests {
                 name: "Guest".to_string(),
                 role: UserRole::User,
                 api_key_hash: crate::password_hash::hash_password("user-key").unwrap(),
+                user_id: UserId::from_name("Guest"),
             }]),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route(
@@ -1171,6 +1213,7 @@ mod tests {
             user_api_keys: Arc::new(vec![]),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/", get(|| async { "dashboard html" }))
@@ -1204,9 +1247,11 @@ mod tests {
                 name: "Guest".to_string(),
                 role: UserRole::User,
                 api_key_hash: crate::password_hash::hash_password("user-key").unwrap(),
+                user_id: UserId::from_name("Guest"),
             }]),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route(
@@ -1243,6 +1288,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: true,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/agents", get(|| async { "agents listing" }))
@@ -1277,6 +1323,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: true,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/agents", get(|| async { "agents listing" }))
@@ -1308,6 +1355,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: true,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/health", get(|| async { "ok" }))
@@ -1338,6 +1386,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/agents", get(|| async { "agents listing" }))
@@ -1375,6 +1424,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app_off = Router::new()
             .route("/api/health", get(|| async { "ok" }))
@@ -1421,6 +1471,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: true,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app_on = Router::new()
             .route("/api/health/detail", get(|| async { "detail" }))
@@ -1451,6 +1502,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: true,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/status", get(|| async { "status" }))
@@ -1487,9 +1539,11 @@ mod tests {
                 name: "alice".into(),
                 role: UserRole::User,
                 api_key_hash: crate::password_hash::hash_password("alice-key").unwrap(),
+                user_id: UserId::from_name("alice"),
             }]),
             require_auth_for_reads: true,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/agents", get(|| async { "agents listing" }))
@@ -1539,6 +1593,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: true,
             allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/agents", get(|| async { "agents listing" }))
@@ -1580,6 +1635,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         }
     }
 
@@ -1591,6 +1647,7 @@ mod tests {
             user_api_keys: Arc::new(Vec::new()),
             require_auth_for_reads: false,
             allow_no_auth: false,
+            audit_log: None,
         }
     }
 

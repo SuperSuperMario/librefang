@@ -352,6 +352,11 @@ pub struct UserConfig {
     /// Optional API key hash for API authentication.
     #[serde(default)]
     pub api_key_hash: Option<String>,
+    /// RBAC M5: per-user spend caps. `None` means "no per-user cap" — the
+    /// user is still bounded by global / per-agent / per-provider budgets.
+    /// See [`UserBudgetConfig`] for the supported windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<UserBudgetConfig>,
     /// Per-user tool allow/deny lists. Layered ON TOP of the per-agent
     /// `ToolPolicy` and any channel rules in `ApprovalPolicy`.
     /// `None` means "no per-user policy — defer to other layers".
@@ -376,6 +381,61 @@ pub struct UserConfig {
 
 fn default_role() -> String {
     "user".to_string()
+}
+
+impl Default for UserConfig {
+    fn default() -> Self {
+        // Mirrors the per-field `#[serde(default)]` attributes above so a
+        // hand-built `UserConfig::default()` matches what
+        // `serde::from_str("name = \"x\"")` would produce. Tests use
+        // `UserConfig { name: ..., role: ..., api_key_hash: ...,
+        // ..Default::default() }` to avoid restating every optional
+        // RBAC field at every fixture site.
+        Self {
+            name: String::new(),
+            role: default_role(),
+            channel_bindings: HashMap::new(),
+            api_key_hash: None,
+            budget: None,
+            tool_policy: None,
+            tool_categories: None,
+            memory_access: None,
+            channel_tool_rules: HashMap::new(),
+        }
+    }
+}
+
+/// RBAC M5: per-user spending budget.
+///
+/// Mirrors the global [`BudgetConfig`] window structure (hourly / daily /
+/// monthly) so the same cost-attribution pipeline can enforce both. Set
+/// any limit to `0.0` for "unlimited on that window". `alert_threshold`
+/// is the fraction of any limit at which the metering layer should emit
+/// a `BudgetExceeded` audit pre-warning (default 0.8, clamped to 0..=1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+#[serde(default)]
+pub struct UserBudgetConfig {
+    /// Maximum cost in USD per hour for this user (0.0 = unlimited).
+    pub max_hourly_usd: f64,
+    /// Maximum cost in USD per day for this user (0.0 = unlimited).
+    pub max_daily_usd: f64,
+    /// Maximum cost in USD per month for this user (0.0 = unlimited).
+    pub max_monthly_usd: f64,
+    /// Alert threshold (0..=1). Metering surfaces a BudgetExceeded audit
+    /// when *any* window reaches this fraction of its limit. Defaults to
+    /// 0.8 — same default as the global budget — for consistency.
+    pub alert_threshold: f64,
+}
+
+impl Default for UserBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_hourly_usd: 0.0,
+            max_daily_usd: 0.0,
+            max_monthly_usd: 0.0,
+            alert_threshold: 0.8,
+        }
+    }
 }
 
 /// Maps platform-native group/server roles (Telegram admin, Discord guild role,

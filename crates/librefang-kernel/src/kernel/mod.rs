@@ -4558,6 +4558,8 @@ system_prompt = "You are a helpful assistant."
             result.total_usage.cache_read_input_tokens,
             result.total_usage.cache_creation_input_tokens,
         );
+        // Ephemeral side-questions have no sender context — no user/channel
+        // attribution to record. Per-user budget rollup will skip these.
         let usage_record = librefang_memory::usage::UsageRecord {
             agent_id,
             provider: manifest.model.provider.clone(),
@@ -4567,6 +4569,8 @@ system_prompt = "You are a helpful assistant."
             cost_usd: cost,
             tool_calls: result.decision_traces.len() as u32,
             latency_ms,
+            user_id: None,
+            channel: None,
         };
         if let Err(e) = self.metering.check_all_and_record(
             &usage_record,
@@ -5780,6 +5784,15 @@ system_prompt = "You are a helpful assistant."
         };
         let kernel_clone = Arc::clone(self);
 
+        // RBAC M5: snapshot the caller's UserId / channel from the inbound
+        // SenderContext before we move into the spawned task. The auth
+        // manager maps `(channel, platform_id)` → UserId; if no binding
+        // exists we still record the channel so the spend rolls up under
+        // an "unknown user" bucket on that channel.
+        let attribution_user_id: Option<UserId> =
+            sender_context.and_then(|sc| self.auth.identify(&sc.channel, &sc.user_id));
+        let attribution_channel: Option<String> = sender_context.map(|sc| sc.channel.clone());
+
         // `loop_opts` is already a local — the spawned async move will
         // capture it. Agent loop reads these at each turn-end / save /
         // tool-exec checkpoint (see `LoopOptions::is_fork` and
@@ -6034,6 +6047,10 @@ system_prompt = "You are a helpful assistant."
                         cost_usd: cost,
                         tool_calls: result.decision_traces.len() as u32,
                         latency_ms,
+                        // RBAC M5: attribution captured from sender_context
+                        // before the spawn — moves into this async block.
+                        user_id: attribution_user_id,
+                        channel: attribution_channel.clone(),
                     };
                     if let Err(e) = kernel_clone.metering.check_all_and_record(
                         &usage_record,
@@ -6045,7 +6062,45 @@ system_prompt = "You are a helpful assistant."
                             error = %e,
                             "Post-call quota check failed (streaming); recording usage anyway"
                         );
+                        // Hash-chain audit: record BudgetExceeded so the
+                        // operator can correlate denied calls with spend.
+                        kernel_clone.audit_log.record_with_context(
+                            agent_id.to_string(),
+                            librefang_runtime::audit::AuditAction::BudgetExceeded,
+                            format!("{e}"),
+                            "denied",
+                            attribution_user_id,
+                            attribution_channel.clone(),
+                        );
                         let _ = kernel_clone.metering.record(&usage_record);
+                    } else if let Some(uid) = attribution_user_id {
+                        // RBAC M5: per-user budget enforcement, post-call.
+                        // `check_all_and_record` already persisted the row,
+                        // so `query_user_*` reflects this call. A breach
+                        // doesn't roll back the current response (tokens
+                        // were already billed) — it trips BudgetExceeded
+                        // so the next call from this user gets denied at
+                        // the gate.
+                        if let Some(user_budget) = kernel_clone.auth.budget_for(uid) {
+                            if let Err(e) =
+                                kernel_clone.metering.check_user_budget(uid, &user_budget)
+                            {
+                                tracing::warn!(
+                                    agent_id = %agent_id,
+                                    user = %uid,
+                                    error = %e,
+                                    "Per-user budget check failed (streaming)"
+                                );
+                                kernel_clone.audit_log.record_with_context(
+                                    agent_id.to_string(),
+                                    librefang_runtime::audit::AuditAction::BudgetExceeded,
+                                    format!("{e}"),
+                                    "denied",
+                                    Some(uid),
+                                    attribution_channel.clone(),
+                                );
+                            }
+                        }
                     }
 
                     // Record experiment metrics if running an experiment.
@@ -7617,6 +7672,11 @@ system_prompt = "You are a helpful assistant."
             result.total_usage.cache_read_input_tokens,
             result.total_usage.cache_creation_input_tokens,
         );
+        // RBAC M5: derive user/channel attribution from the inbound sender
+        // so per-user budgets and audit events can roll up per call.
+        let attribution_user_id: Option<UserId> =
+            sender_context.and_then(|sc| self.auth.identify(&sc.channel, &sc.user_id));
+        let attribution_channel: Option<String> = sender_context.map(|sc| sc.channel.clone());
         let usage_record = librefang_memory::usage::UsageRecord {
             agent_id,
             provider: manifest.model.provider.clone(),
@@ -7626,6 +7686,8 @@ system_prompt = "You are a helpful assistant."
             cost_usd: cost,
             tool_calls: result.decision_traces.len() as u32,
             latency_ms,
+            user_id: attribution_user_id,
+            channel: attribution_channel.clone(),
         };
         if let Err(e) = self.metering.check_all_and_record(
             &usage_record,
@@ -7639,8 +7701,43 @@ system_prompt = "You are a helpful assistant."
                 error = %e,
                 "Post-call quota check failed; usage recorded anyway to keep accounting accurate"
             );
+            // Hash-chain audit: BudgetExceeded surfaces in `/api/audit/query`
+            // so an operator can correlate the denial with the user / channel.
+            self.audit_log.record_with_context(
+                agent_id.to_string(),
+                librefang_runtime::audit::AuditAction::BudgetExceeded,
+                format!("{e}"),
+                "denied",
+                attribution_user_id,
+                attribution_channel.clone(),
+            );
             // Fall back to plain record so the cost is not lost from tracking
             let _ = self.metering.record(&usage_record);
+        } else if let Some(uid) = attribution_user_id {
+            // RBAC M5: per-user budget enforcement, post-call (matches the
+            // global / per-agent / per-provider semantics — the row was
+            // already persisted above so `query_user_*` includes this
+            // call). A breach trips BudgetExceeded for downstream gating
+            // and dashboard visibility; the current response is returned
+            // unchanged because the tokens are already billed.
+            if let Some(user_budget) = self.auth.budget_for(uid) {
+                if let Err(e) = self.metering.check_user_budget(uid, &user_budget) {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        user = %uid,
+                        error = %e,
+                        "Per-user budget check failed"
+                    );
+                    self.audit_log.record_with_context(
+                        agent_id.to_string(),
+                        librefang_runtime::audit::AuditAction::BudgetExceeded,
+                        format!("{e}"),
+                        "denied",
+                        Some(uid),
+                        attribution_channel.clone(),
+                    );
+                }
+            }
         }
 
         // Populate cost on the result based on usage_footer mode
@@ -13732,6 +13829,10 @@ system_prompt = "You are a helpful assistant."
                 // is single-shot, so tool_calls is always 0.
                 tool_calls: 0,
                 latency_ms,
+                // Background review is a kernel-internal task — no caller
+                // attribution. Spend rolls up under `system`.
+                user_id: None,
+                channel: Some("system".to_string()),
             };
             if let Err(e) = kernel.metering.record(&usage_record) {
                 tracing::debug!(error = %e, "Failed to record background review usage");

@@ -366,6 +366,7 @@ async fn users_update_and_import_preserve_rbac_m3_policy_fields() {
             m
         },
         api_key_hash: None,
+        budget: None,
         tool_policy: Some(UserToolPolicy {
             allowed_tools: vec!["web_search".into()],
             denied_tools: vec!["shell_exec".into()],
@@ -451,6 +452,97 @@ async fn users_update_and_import_preserve_rbac_m3_policy_fields() {
     assert_eq!(
         after_import.memory_access, seed.memory_access,
         "memory_access was clobbered by bulk import"
+    );
+}
+
+/// PR #3203 (RBAC M5) regression — `UserConfig.budget` must survive
+/// PUT and CSV-reimport edits the same way the M3 policy fields do.
+/// Without preserve logic, `..new_u.clone()` in the import-update branch
+/// silently zeroes a per-user spend cap because CSV rows always carry
+/// `budget: None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn users_update_and_import_preserve_m5_budget() {
+    use librefang_types::config::UserBudgetConfig;
+    use std::collections::HashMap;
+
+    let seeded_budget = UserBudgetConfig {
+        max_hourly_usd: 1.0,
+        max_daily_usd: 10.0,
+        max_monthly_usd: 100.0,
+        alert_threshold: 0.75,
+    };
+    let seed = UserConfig {
+        name: "Carol".into(),
+        role: "user".into(),
+        channel_bindings: HashMap::new(),
+        api_key_hash: None,
+        budget: Some(seeded_budget.clone()),
+        ..Default::default()
+    };
+    let h = boot_with_seed_users(vec![seed.clone()]).await;
+
+    // 1. PUT — name + role edit, no budget in payload. Server must
+    //    fill budget back from the pre-existing config.
+    let (status, _) = json_request(
+        &h,
+        Method::PUT,
+        "/api/users/Carol",
+        Some(serde_json::json!({
+            "name": "CarolRenamed",
+            "role": "admin",
+            "channel_bindings": {}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after_put = h
+        ._state
+        .kernel
+        .config_ref()
+        .users
+        .iter()
+        .find(|u| u.name == "CarolRenamed")
+        .cloned()
+        .expect("renamed user must exist");
+    assert_eq!(after_put.role, "admin", "role change applied");
+    assert_eq!(
+        after_put.budget,
+        Some(seeded_budget.clone()),
+        "budget was clobbered by PUT — per-user spend cap silently wiped"
+    );
+
+    // 2. Bulk-import update — same user, no budget in CSV row. The
+    //    import path's "if name matches existing" branch must also
+    //    preserve the budget.
+    let (status, _) = json_request(
+        &h,
+        Method::POST,
+        "/api/users/import",
+        Some(serde_json::json!({
+            "dry_run": false,
+            "rows": [
+                {"name": "CarolRenamed", "role": "user"},
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after_import = h
+        ._state
+        .kernel
+        .config_ref()
+        .users
+        .iter()
+        .find(|u| u.name == "CarolRenamed")
+        .cloned()
+        .expect("user must still exist after import");
+    assert_eq!(after_import.role, "user", "import applied role change");
+    assert_eq!(
+        after_import.budget,
+        Some(seeded_budget),
+        "budget was clobbered by bulk import — ..new_u.clone() bug regressed"
     );
 }
 

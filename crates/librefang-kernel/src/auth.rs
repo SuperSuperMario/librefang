@@ -129,6 +129,11 @@ pub struct UserIdentity {
     /// channel_tool_rules}`. Defaults to `ResolvedUserPolicy::default()`
     /// when no per-user policy was declared.
     pub policy: ResolvedUserPolicy,
+    /// RBAC M5: per-user spending caps. `None` means "no per-user budget"
+    /// — the user is still bounded by global / per-agent / per-provider
+    /// budgets. When `Some`, [`MeteringEngine::check_user_budget`]
+    /// enforces the listed windows after every LLM call.
+    pub budget: Option<librefang_types::config::UserBudgetConfig>,
 }
 
 /// Cache key for resolved channel roles.
@@ -224,6 +229,7 @@ impl AuthManager {
                 name: config.name.clone(),
                 role,
                 policy,
+                budget: config.budget.clone(),
             };
 
             self.users.insert(user_id, identity);
@@ -492,6 +498,15 @@ impl AuthManager {
     /// Get the resolved per-user RBAC policy for a user, if registered.
     pub fn user_policy(&self, user_id: UserId) -> Option<ResolvedUserPolicy> {
         self.users.get(&user_id).map(|r| r.value().policy.clone())
+    }
+
+    /// Get the per-user spending budget (RBAC M5) for a user, if
+    /// registered AND configured with `[users.budget]`. `None` for
+    /// either an unknown user or a user with no per-user cap declared
+    /// — in both cases the metering layer falls back to the global /
+    /// per-agent / per-provider budgets only.
+    pub fn budget_for(&self, user_id: UserId) -> Option<librefang_types::config::UserBudgetConfig> {
+        self.users.get(&user_id)?.value().budget.clone()
     }
 
     /// Get the memory namespace ACL for a user (if registered) merged
@@ -844,6 +859,7 @@ mod tests {
                     m
                 },
                 api_key_hash: None,
+                budget: None,
                 tool_policy: None,
                 tool_categories: None,
                 memory_access: None,
@@ -858,6 +874,7 @@ mod tests {
                     m
                 },
                 api_key_hash: None,
+                budget: None,
                 tool_policy: None,
                 tool_categories: None,
                 memory_access: None,
@@ -868,6 +885,7 @@ mod tests {
                 role: "viewer".to_string(),
                 channel_bindings: HashMap::new(),
                 api_key_hash: None,
+                budget: None,
                 tool_policy: None,
                 tool_categories: None,
                 memory_access: None,
@@ -1035,6 +1053,7 @@ mod tests {
                 m
             },
             api_key_hash: None,
+            budget: None,
             tool_policy,
             tool_categories,
             memory_access,
@@ -1374,6 +1393,7 @@ mod channel_role_tests {
             tool_categories: None,
             memory_access: None,
             channel_tool_rules: HashMap::new(),
+            budget: None,
         }];
         let mgr = AuthManager::new(&configs);
         let calls = Arc::new(AtomicUsize::new(0));
