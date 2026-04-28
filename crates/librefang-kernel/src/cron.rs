@@ -697,10 +697,40 @@ pub fn compute_next_run_after(
                             match tz_str.parse::<chrono_tz::Tz>() {
                                 Ok(timezone) => {
                                     let base_local = base.with_timezone(&timezone);
-                                    sched
+                                    let result = sched
                                         .after(&base_local)
                                         .next()
-                                        .map(|dt| dt.with_timezone(&Utc))
+                                        .map(|dt| dt.with_timezone(&Utc));
+
+                                    // Warn when a DST boundary is crossed: spring-forward may
+                                    // silently skip a scheduled local time; fall-back picks the
+                                    // earlier UTC occurrence.
+                                    if let Some(next) = result {
+                                        let next_local = next.with_timezone(&timezone);
+                                        let base_utc_secs = (base_local.naive_utc()
+                                            - base_local.naive_local())
+                                        .num_seconds();
+                                        let next_utc_secs = (next_local.naive_utc()
+                                            - next_local.naive_local())
+                                        .num_seconds();
+                                        if base_utc_secs != next_utc_secs {
+                                            warn!(
+                                                expr = %expr,
+                                                timezone = %tz_str,
+                                                base_local = %base_local.format("%Y-%m-%dT%H:%M:%S%z"),
+                                                adjusted_utc = %next.format("%Y-%m-%dT%H:%M:%SZ"),
+                                                adjusted_local = %next_local.format("%Y-%m-%dT%H:%M:%S%z"),
+                                                "Cron job next-fire crosses a DST boundary in \
+                                                 timezone '{}'; scheduled local time may have been \
+                                                 skipped (spring-forward) or moved to the first \
+                                                 occurrence (fall-back). Next fire adjusted to {}",
+                                                tz_str,
+                                                next.format("%Y-%m-%dT%H:%M:%SZ"),
+                                            );
+                                        }
+                                    }
+
+                                    result
                                 }
                                 Err(_) => {
                                     warn!(

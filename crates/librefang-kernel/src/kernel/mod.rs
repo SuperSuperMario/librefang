@@ -61,6 +61,19 @@ pub(crate) const SYSTEM_CHANNEL_CRON: &str = "cron";
 /// have no user to attribute to. Issue #3243.
 pub(crate) const SYSTEM_CHANNEL_AUTONOMOUS: &str = "autonomous";
 
+// ---------------------------------------------------------------------------
+// Per-task trigger recursion depth (bug #3780)
+// ---------------------------------------------------------------------------
+
+// Per-task trigger-chain recursion depth counter.
+// Declared at module level so it has a true `'static` key, as required by
+// `tokio::task_local!`.  Each independent event-processing task establishes
+// its own scope via `PUBLISH_EVENT_DEPTH.scope(Cell::new(0), future)`,
+// keeping depth counts isolated between concurrent chains.
+tokio::task_local! {
+    static PUBLISH_EVENT_DEPTH: std::cell::Cell<u32>;
+}
+
 /// Build the MCP bridge config that lets CLI-based drivers (Claude Code)
 /// reach back into the daemon's own `/mcp` endpoint. Uses loopback when the
 /// API listens on a wildcard address.
@@ -11091,14 +11104,32 @@ system_prompt = "You are a helpful assistant."
     /// Returns the list of trigger matches that were dispatched.
     /// Includes depth limiting to prevent circular trigger chains.
     pub async fn publish_event(&self, event: Event) -> Vec<crate::triggers::TriggerMatch> {
+        let already_scoped = PUBLISH_EVENT_DEPTH.try_with(|_| ()).is_ok();
+
+        if already_scoped {
+            self.publish_event_inner(event).await
+        } else {
+            // Top-level invocation — establish an isolated per-chain scope.
+            PUBLISH_EVENT_DEPTH
+                .scope(std::cell::Cell::new(0), self.publish_event_inner(event))
+                .await
+        }
+    }
+
+    /// Inner body of [`publish_event`]; requires `PUBLISH_EVENT_DEPTH` scope to be active.
+    async fn publish_event_inner(&self, event: Event) -> Vec<crate::triggers::TriggerMatch> {
         let cfg = self.config.load_full();
-        // Depth guard: prevent circular trigger chains
-        static TRIGGER_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let max_trigger_depth = cfg.triggers.max_depth as u32;
 
-        let depth = TRIGGER_DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let depth = PUBLISH_EVENT_DEPTH.with(|c| {
+            let d = c.get();
+            c.set(d + 1);
+            d
+        });
+
         if depth >= max_trigger_depth {
-            TRIGGER_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            // Restore before returning — no drop guard in the early-exit path.
+            PUBLISH_EVENT_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
             warn!(
                 depth,
                 "Trigger depth limit reached, skipping evaluation to prevent circular chain"
@@ -11106,11 +11137,12 @@ system_prompt = "You are a helpful assistant."
             return vec![];
         }
 
-        // Decrement depth on all exit paths using a drop guard
+        // Decrement on all exit paths via drop guard.
         struct DepthGuard;
         impl Drop for DepthGuard {
             fn drop(&mut self) {
-                TRIGGER_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                // Guard is only created after the early-exit check, so the scope is always active.
+                let _ = PUBLISH_EVENT_DEPTH.try_with(|c| c.set(c.get().saturating_sub(1)));
             }
         }
         let _guard = DepthGuard;
