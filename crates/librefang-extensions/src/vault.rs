@@ -120,10 +120,13 @@ const NONCE_LEN: usize = 12;
 /// Magic bytes for vault file format versioning.
 const VAULT_MAGIC: &[u8; 4] = b"OFV1";
 
+/// AAD schema version; 0 = legacy path-only AAD, 1 = schema_version_le_bytes || path_bytes.
+const VAULT_SCHEMA_VERSION: u32 = 1;
+
 /// On-disk vault format (encrypted).
 #[derive(Serialize, Deserialize)]
 struct VaultFile {
-    /// Version marker.
+    /// File-format version marker (always 1; not the AAD schema version).
     version: u8,
     /// Argon2 salt (base64).
     salt: String,
@@ -131,6 +134,9 @@ struct VaultFile {
     nonce: String,
     /// Encrypted data (base64).
     ciphertext: String,
+    /// AAD schema version; defaults to 0 on legacy files (path-only AAD compat).
+    #[serde(default)]
+    schema_version: u32,
 }
 
 /// Decrypted vault entries.
@@ -345,12 +351,17 @@ impl CredentialVault {
         Err(ExtensionError::VaultLocked)
     }
 
-    /// Save encrypted vault to disk.
-    ///
-    /// The vault file path is used as AES-GCM Additional Associated Data (AAD)
-    /// so that a ciphertext blob cannot be silently transplanted to a different
-    /// path or a different install's vault file — decryption will fail with an
-    /// authentication error if the path recorded at encryption time differs.
+    /// Returns `schema_version_le_bytes || path_bytes` as AES-GCM AAD.
+    fn aad_bytes(path: &std::path::Path, schema_version: u32) -> Vec<u8> {
+        let path_str = path.to_string_lossy();
+        let path_bytes = path_str.as_bytes();
+        let mut buf = Vec::with_capacity(4 + path_bytes.len());
+        buf.extend_from_slice(&schema_version.to_le_bytes());
+        buf.extend_from_slice(path_bytes);
+        buf
+    }
+
+    /// Save encrypted vault to disk; AAD binds ciphertext to path + schema version.
     fn save(&self, master_key: &[u8; 32]) -> ExtensionResult<()> {
         // Serialize entries to JSON
         let plain_entries: HashMap<String, String> = self
@@ -375,20 +386,16 @@ impl CredentialVault {
         // Derive encryption key from master key + salt using Argon2
         let derived_key = derive_key(master_key, &salt)?;
 
-        // Encrypt with AES-256-GCM, binding the ciphertext to this vault's
-        // canonical path via AAD. An adversary who copies the raw vault file to
-        // a different path (or to another install) will receive an authentication
-        // error on decrypt rather than silently obtaining a valid plaintext.
         let cipher = Aes256Gcm::new_from_slice(derived_key.as_ref())
             .map_err(|e| ExtensionError::Vault(format!("Cipher init failed: {e}")))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let aad = self.path.to_string_lossy();
+        let aad = Self::aad_bytes(&self.path, VAULT_SCHEMA_VERSION);
         let ciphertext = cipher
             .encrypt(
                 nonce,
                 Payload {
                     msg: plaintext.as_slice(),
-                    aad: aad.as_bytes(),
+                    aad: &aad,
                 },
             )
             .map_err(|e| ExtensionError::Vault(format!("Encryption failed: {e}")))?;
@@ -402,6 +409,7 @@ impl CredentialVault {
                 &base64::engine::general_purpose::STANDARD,
                 &ciphertext,
             ),
+            schema_version: VAULT_SCHEMA_VERSION,
         };
         let content = serde_json::to_string_pretty(&vault_file)
             .map_err(|e| ExtensionError::Vault(format!("Vault file serialization failed: {e}")))?;
@@ -415,20 +423,33 @@ impl CredentialVault {
         output.extend_from_slice(VAULT_MAGIC);
         output.extend_from_slice(content.as_bytes());
 
-        // Atomic write: write to a sibling .tmp file (same filesystem guarantees
-        // rename is atomic), fsync to flush to disk, then rename over the target.
-        // A crash mid-write leaves only the .tmp file; the vault is never corrupt.
+        // Atomic write to .tmp (mode 0600 on Unix) then rename over target.
         let temp_path = self.path.with_extension("tmp");
         {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp_path)?;
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&temp_path)?;
             f.write_all(&output)?;
             f.sync_all()?;
         }
         std::fs::rename(&temp_path, &self.path)?;
+        // Enforce 0600 if a pre-existing file had looser perms.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&self.path) {
+                let mut perms = meta.permissions();
+                if perms.mode() & 0o777 != 0o600 {
+                    perms.set_mode(0o600);
+                    let _ = std::fs::set_permissions(&self.path, perms);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -480,20 +501,26 @@ impl CredentialVault {
         // Derive key
         let derived_key = derive_key(master_key, &salt)?;
 
-        // Decrypt, supplying the vault path as AAD so the authentication tag
-        // covers both the ciphertext and the path. A file swapped from a
-        // different path will fail here with "Decryption failed".
+        // schema_version=0 on disk means path-only AAD (legacy compat); save() rewrites at v1.
         let cipher = Aes256Gcm::new_from_slice(derived_key.as_ref())
             .map_err(|e| ExtensionError::Vault(format!("Cipher init failed: {e}")))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let aad = self.path.to_string_lossy();
+        let aad: Vec<u8> = match vault_file.schema_version {
+            0 => self.path.to_string_lossy().as_bytes().to_vec(),
+            v if v == VAULT_SCHEMA_VERSION => Self::aad_bytes(&self.path, v),
+            other => {
+                return Err(ExtensionError::Vault(format!(
+                    "Unsupported vault AAD schema version: {other}"
+                )));
+            }
+        };
         let plaintext = Zeroizing::new(
             cipher
                 .decrypt(
                     nonce,
                     Payload {
                         msg: ciphertext.as_slice(),
-                        aad: aad.as_bytes(),
+                        aad: &aad,
                     },
                 )
                 .map_err(|e| ExtensionError::Vault(format!("Decryption failed: {e}")))?,
@@ -618,7 +645,43 @@ fn store_keyring_key(key_b64: &str) -> Result<(), String> {
         };
         let content =
             serde_json::to_string_pretty(&keyring_file).map_err(|e| format!("json: {e}"))?;
-        std::fs::write(&keyring_path, content).map_err(|e| format!("write: {e}"))?;
+
+        // Atomic write with mode 0600 on Unix; non-Unix relies on OS ACLs.
+        let tmp_path = keyring_path.with_extension(format!("keyring.tmp.{}", std::process::id()));
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp_path)?;
+            f.write_all(content.as_bytes())?;
+            f.flush()?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp_path, &keyring_path)
+        })();
+
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("write: {e}"));
+        }
+
+        // Enforce 0600 if destination pre-existed with looser perms.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&keyring_path) {
+                let mut perms = meta.permissions();
+                if perms.mode() & 0o777 != 0o600 {
+                    perms.set_mode(0o600);
+                    let _ = std::fs::set_permissions(&keyring_path, perms);
+                }
+            }
+        }
         Ok(())
     }
     #[cfg(test)]
@@ -1020,6 +1083,113 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(msg.contains("Unrecognized vault file format"));
+    }
+
+    /// Regression test for #3788: a file with schema_version=0 (legacy
+    /// path-only AAD) must still decrypt with the path-only AAD path so
+    /// pre-#3788 vaults keep working after upgrade.
+    #[test]
+    fn vault_legacy_schema_version_zero_decrypts_with_path_only_aad() {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::Aes256Gcm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let key = random_key();
+
+        // Hand-roll a legacy v0 ciphertext blob using the path as the only
+        // AAD (the pre-#3788 layout) so we exercise the compat decode
+        // branch without depending on git history.
+        let plain = serde_json::to_vec(&VaultEntries {
+            secrets: {
+                let mut m = HashMap::new();
+                m.insert("LEGACY_KEY".to_string(), "legacy_value".to_string());
+                m
+            },
+        })
+        .unwrap();
+
+        let mut salt = [0u8; SALT_LEN];
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut salt);
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let derived = derive_key(&key, &salt).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(derived.as_ref()).unwrap();
+        let path_only_aad = path.to_string_lossy();
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: plain.as_slice(),
+                    aad: path_only_aad.as_bytes(),
+                },
+            )
+            .unwrap();
+
+        let legacy_file = VaultFile {
+            version: 1,
+            salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, salt),
+            nonce: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes),
+            ciphertext: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ct),
+            schema_version: 0, // ← legacy
+        };
+        let json = serde_json::to_string(&legacy_file).unwrap();
+        let mut out = Vec::with_capacity(VAULT_MAGIC.len() + json.len());
+        out.extend_from_slice(VAULT_MAGIC);
+        out.extend_from_slice(json.as_bytes());
+        std::fs::write(&path, &out).unwrap();
+
+        let mut vault = CredentialVault::new(path);
+        vault.unlock_with_key(key).unwrap();
+        assert_eq!(vault.get("LEGACY_KEY").unwrap().as_str(), "legacy_value");
+    }
+
+    /// Regression test for #3788: a file written at schema_version=1 must
+    /// fail to decrypt if an attacker downgrades the field to 0 because
+    /// the AAD recorded at encryption time included the version bytes.
+    #[test]
+    fn vault_rejects_schema_version_downgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let key = random_key();
+
+        let mut vault = CredentialVault::new(path.clone());
+        vault.init_with_key(key.clone()).unwrap();
+        vault
+            .set("K".to_string(), Zeroizing::new("v".to_string()))
+            .unwrap();
+        drop(vault);
+
+        // Tamper with schema_version on disk: 1 → 0
+        let raw = std::fs::read(&path).unwrap();
+        let json_start = VAULT_MAGIC.len();
+        let mut file: VaultFile = serde_json::from_slice(&raw[json_start..]).unwrap();
+        assert_eq!(file.schema_version, VAULT_SCHEMA_VERSION);
+        file.schema_version = 0;
+        let mut tampered = Vec::with_capacity(raw.len());
+        tampered.extend_from_slice(VAULT_MAGIC);
+        tampered.extend_from_slice(serde_json::to_string_pretty(&file).unwrap().as_bytes());
+        std::fs::write(&path, &tampered).unwrap();
+
+        let mut vault2 = CredentialVault::new(path);
+        let res = vault2.unlock_with_key(key);
+        assert!(
+            res.is_err(),
+            "schema_version downgrade must fail authentication"
+        );
+    }
+
+    /// Regression test for #3724: vault.enc must be created with mode 0600
+    /// on Unix so the encrypted blob is never world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn vault_file_is_chmod_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, mut vault) = test_vault();
+        let key = random_key();
+        vault.init_with_key(key).unwrap();
+        let mode = std::fs::metadata(&vault.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "vault.enc must be 0600, got {mode:o}");
     }
 
     /// Regression test for #3788: copying a vault file to a different path
